@@ -7,14 +7,14 @@ requires-python = ">=3.10"
 authors = [{name = "sql-mcp", email = "dev@example.com"}]
 license = {text = "MIT"}
 
-[project.dependencies]
-fastmcp = "^0.1"
-SQLAlchemy = "^1.4"
-pydantic-settings = "^0.1"
-pydantic = "^2.6"
-psycopg2-binary = {version = "^2.9", optional = true}
-pymysql = {version = "^1.0", optional = true}
-pyodbc = {version = "^4.0", optional = true}
+dependencies = [
+    "fastmcp>=0.1,<0.2",
+    "SQLAlchemy>=1.4,<2",
+    "pydantic-settings>=0.2.5,<3",
+    "pydantic>=2.7,<2.8",
+    "fastapi>=0.95,<0.96",
+    "uvicorn>=0.22,<0.23",
+]
 
 [project.optional-dependencies]
 postgresql = ["psycopg2-binary"]
