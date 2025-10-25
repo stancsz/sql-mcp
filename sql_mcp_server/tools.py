@@ -44,6 +44,37 @@ def _strip_sql_comments(sql: str) -> str:
     sql = re.sub(r"--.*?$", " ", sql, flags=re.M)
     return sql
 
+def _strip_outer_parentheses(sql: str) -> str:
+    """
+    Remove a single pair (or repeated nested pairs) of balanced outer
+    parentheses that enclose the entire statement.
+
+    This helps databases like SQLite which do not accept a top-level
+    parenthesized SELECT (e.g. "(SELECT ... )"). The function only
+    removes outer pairs that balance across the whole string and will
+    not touch parentheses that are not enclosing the full statement.
+    """
+    s = sql.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        match_index = None
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    match_index = i
+                    break
+        # If the first matching closing parenthesis is at the very end,
+        # the outer parentheses enclose the whole string -> strip them.
+        if match_index is not None and match_index == len(s) - 1:
+            s = s[1:-1].strip()
+            # continue to remove additional nested outer pairs, if any
+            continue
+        break
+    return s
+
 
 def _is_read_only_sql_regex(sql: str) -> bool:
     """
@@ -212,7 +243,11 @@ class SQLMCPTools:
         dependency when not needed.
         Raises ValueError if query is not permitted or execution fails.
         """
-        if not _is_read_only_sql(sql_query):
+        # Normalize the SQL by stripping balanced outer parentheses which some
+        # databases (notably SQLite) don't accept for a top-level statement.
+        normalized_sql = _strip_outer_parentheses(sql_query)
+
+        if not _is_read_only_sql(normalized_sql):
             raise ValueError("Only single-statement read-only SELECT/WITH queries are allowed")
 
         # Lazy import prometheus metrics (optional)
@@ -247,7 +282,9 @@ class SQLMCPTools:
         try:
             with self.engine.connect() as conn:
                 # Use a safe SQL text construct; SQLAlchemy will handle parameters and execution.
-                stmt = text(sql_query)
+                # Execute the normalized SQL (outer parentheses stripped) to accommodate DBs
+                # like SQLite which reject a top-level parenthesized SELECT.
+                stmt = text(normalized_sql)
                 result = conn.execute(stmt)
                 # mappings() returns rows as dict-like objects
                 rows = [dict(r) for r in result.mappings().all()]
