@@ -85,6 +85,13 @@ CI 行為
 實作重點與安全設計
 - SQL 允許性檢查：execute_read_only_sql 先移除註解、禁止多重語句（分號分隔）、確保第一個 token 為 SELECT 或 WITH，並檢查整個查詢中是否含有禁止的關鍵字（以完整單字比對）。
 - 此檢查採保守策略；在高安全需求環境建議搭配完整 SQL 解析器（例如 sqlparse、或更嚴格的 AST 檢查）做二次驗證。
+
+SQL parser (recommended)
+- For stronger, token-level SQL validation (ignoring string literals and comments), install the parsing extra:
+```bash
+python -m pip install -e ".[parsing]"
+```
+When `sqlparse` is installed, the server will use token-level checks to more accurately distinguish SQL keywords from literal text and reduce false positives.
 - 使用 SQLAlchemy 引擎並啟用 pool_pre_ping、pool_size、max_overflow 等連線池參數以提升 production 穩定性。
 
 檔案清單（主要）
