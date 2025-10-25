@@ -83,8 +83,30 @@ CI 行為
 - 若不想在本機啟用 Postgres，可暫時以 sqlite 測試：`set DB_TYPE=sqlite && pytest -q`（Windows）或 `DB_TYPE=sqlite pytest -q`（Linux/macOS）。
 
 實作重點與安全設計
-- SQL 允許性檢查：execute_read_only_sql 先移除註解、禁止多重語句（分號分隔）、確保第一個 token 為 SELECT 或 WITH，並檢查整個查詢中是否含有禁止的關鍵字（以完整單字比對）。
-- 此檢查採保守策略；在高安全需求環境建議搭配完整 SQL 解析器（例如 sqlparse、或更嚴格的 AST 檢查）做二次驗證。
+
+- SQL 允許性檢查（Read‑only enforcement）
+  - Allowed leading statements: `SELECT`, `WITH`, `EXPLAIN`, `VALUES`.
+  - Disallowed keywords (examples): `INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `MERGE`, `COPY`, `BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, `ATTACH`, `VACUUM`.
+  - Only single-statement queries are permitted; multi-statement payloads (semicolon-separated) are rejected.
+  - Validation strategy errs on the side of safety: when in doubt, the query is rejected.
+
+- Parser choices & runtime behavior
+  - If the optional `sqlparse` package is installed (recommended), the server uses token-level validation which:
+    - Splits and parses the SQL into a single statement.
+    - Skips comments and string literals, and inspects token types so keywords inside strings do not cause false positives.
+    - More accurately distinguishes keywords from literal text.
+  - If `sqlparse` is not available, a conservative regex-based fallback is used:
+    - Comments are stripped and string/dollar-quoted literals are removed for statement splitting.
+    - For keyword scanning the fallback checks the comment-stripped text (it does not reliably ignore keywords in literals) — this makes the fallback more conservative and may reject queries that contain forbidden words inside string literals.
+  - Recommendation: install the parsing extras in CI / production to enable the sqlparse-based path:
+    ```bash
+    python -m pip install -e ".[parsing]"
+    ```
+
+- Operational recommendations
+  - CI: ensure `sqlparse` is present in the CI environment or explicitly test both code paths.
+  - Runtime: add query execution limits (max length), execution timeout, and database-level resource controls as follow-up tasks.
+  - Security: run the server behind a network boundary or API gateway and apply auth/rate-limiting as needed.
 
 SQL parser (recommended)
 - For stronger, token-level SQL validation (ignoring string literals and comments), install the parsing extra:

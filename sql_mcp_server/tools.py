@@ -1,3 +1,46 @@
+"""
+sql_mcp_server.tools
+
+Read-only SQL validation and execution helpers.
+
+Purpose
+- Enforce a strict read-only policy for user-provided SQL executed by the server.
+- Provide utilities used by SQLMCPTools.execute_read_only_sql() to normalize,
+  validate, and safely execute SELECT-style queries.
+
+Policy summary
+- Allowed leading statements: SELECT, WITH, EXPLAIN, VALUES.
+- Disallowed keywords (examples): INSERT, UPDATE, DELETE, DROP, CREATE,
+  ALTER, TRUNCATE, GRANT, REVOKE, MERGE, COPY, BEGIN, COMMIT, ROLLBACK,
+  SET, ATTACH, VACUUM.
+- Only single-statement queries are permitted. Multi-statement payloads are rejected.
+- Validation errs on the side of safety: when in doubt the validator rejects.
+
+Validation strategy
+1. Prefer sqlparse token-level validation when the `sqlparse` package is
+   available:
+   - Use sqlparse.split()/parse() to ensure a single statement.
+   - Confirm the first meaningful token is in the allowed set.
+   - Walk the flattened token stream and reject any Keyword tokens that
+     match forbidden keywords, while skipping comments and string literals.
+   - sqlparse reduces false positives by distinguishing keywords from literal text.
+
+2. Conservative regex fallback (when sqlparse is not present):
+   - Strip comments, remove string/dollar-quoted literals for statement-splitting,
+     ensure a single statement and that the first token is allowed.
+   - For keyword scanning the fallback checks the comment-stripped SQL without
+     removing string literals (conservative) and will reject queries that
+     include forbidden words even if they appear inside string literals.
+   - This means environments lacking sqlparse will be more conservative.
+
+Notes for operators & CI
+- Recommended: install the parsing extras in CI to run sqlparse-based checks:
+  python -m pip install -e ".[parsing]"
+- CI should explicitly test both paths if desired (with and without sqlparse),
+  or include sqlparse to mirror production parsing behavior.
+- The implementation prioritizes safety; additional runtime limits (query
+  length, execution timeout) are recommended as follow-up tasks.
+"""
 from __future__ import annotations
 import logging
 import re
@@ -9,7 +52,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger("sql_mcp_server.tools")
 
-# Forbidden keywords that must not appear in read-only queries.
+# Expanded forbidden keywords that must not appear in read-only queries.
 FORBIDDEN_KEYWORDS = {
     "INSERT",
     "UPDATE",
@@ -21,7 +64,17 @@ FORBIDDEN_KEYWORDS = {
     "GRANT",
     "REVOKE",
     "MERGE",
+    "COPY",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "SET",
+    "ATTACH",
+    "VACUUM",
 }
+
+# Allowed leading statements for read-only queries.
+ALLOWED_LEADING_KEYWORDS = {"SELECT", "WITH", "EXPLAIN", "VALUES"}
 
 # Try to import sqlparse for stronger validation if available.
 try:
@@ -35,43 +88,111 @@ except Exception:
     _HAS_SQLPARSE = False
     logger.debug("sqlparse not available, falling back to conservative regex checks.")
 
-
 def _strip_sql_comments(sql: str) -> str:
-    """Remove -- single-line and /* */ block comments."""
-    # remove block comments first
+    """Remove --, # single-line and /* */ block comments."""
+    # remove block comments first (/* ... */)
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
-    # remove single-line comments
+    # remove -- single-line comments
     sql = re.sub(r"--.*?$", " ", sql, flags=re.M)
+    # remove hash-style (#) single-line comments (common in some clients)
+    sql = re.sub(r"#.*?$", " ", sql, flags=re.M)
     return sql
 
+def _strip_string_literals(sql: str) -> str:
+    """
+    Replace string and quoted literal contents with spaces so that keyword
+    scanning does not match words inside string literals.
+
+    Handles:
+      - single-quoted strings '...'
+      - double-quoted strings "..." (often used for identifiers)
+      - dollar-quoted strings $tag$...$tag$
+      - simple escaped quotes via backslash are handled conservatively
+    """
+    s = sql
+
+    # Remove dollar-quoted strings: $tag$ ... $tag$
+    s = re.sub(r"\$[^$]*\$.*?\$[^$]*\$", " ", s, flags=re.S)
+
+    # Remove single- and double-quoted strings (naive but practical)
+    # Handles escaped quotes by allowing backslashes inside.
+    s = re.sub(r"'(?:\\.|''|[^'])*'", " ", s, flags=re.S)
+    s = re.sub(r'"(?:\\.|""|[^"])*"', " ", s, flags=re.S)
+
+    return s
+
+def _strip_outer_parentheses(sql: str) -> str:
+    """
+    Remove a single pair (or repeated nested pairs) of balanced outer
+    parentheses that enclose the entire statement.
+
+    This helps databases like SQLite which do not accept a top-level
+    parenthesized SELECT (e.g. "(SELECT ... )"). The function only
+    removes outer pairs that balance across the whole string and will
+    not touch parentheses that are not enclosing the full statement.
+    """
+    s = sql.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        match_index = None
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    match_index = i
+                    break
+        # If the first matching closing parenthesis is at the very end,
+        # the outer parentheses enclose the whole string -> strip them.
+        if match_index is not None and match_index == len(s) - 1:
+            s = s[1:-1].strip()
+            # continue to remove additional nested outer pairs, if any
+            continue
+        break
+    return s
 
 def _is_read_only_sql_regex(sql: str) -> bool:
     """
     Conservative regex-based check (fallback).
-    - Remove comments
-    - Ensure exactly one statement (no multi-statement separated by ;)
-    - Ensure first token is SELECT or WITH
-    - Ensure none of the forbidden keywords appear as whole words
+
+    Strategy:
+    - Strip comments first.
+    - For statement-count and first-token detection, remove string/dollar-quoted literals
+      so semicolons and tokens inside strings do not mislead the splitter.
+    - For forbidden-keyword scanning, use the comment-stripped SQL (do NOT remove
+      string literals) to be conservative when sqlparse is not available — this
+      rejects queries that include forbidden words even inside string literals.
     """
-    stripped = _strip_sql_comments(sql).strip()
-    if not stripped:
+    # Strip comments first
+    stripped_comments = _strip_sql_comments(sql).strip()
+    if not stripped_comments:
         return False
-    # disallow multiple statements separated by semicolon
-    parts = [p for p in re.split(r";\s*", stripped) if p.strip()]
+
+    # Remove string literals only for splitting/token-detection so semicolons inside
+    # strings don't create false multi-statement detections.
+    stripped_for_split = _strip_string_literals(stripped_comments)
+
+    # Naively split on semicolons in the string-literal-stripped SQL.
+    parts = [p for p in re.split(r";\s*", stripped_for_split) if p.strip()]
     if len(parts) != 1:
         return False
-    first_match = re.match(r"^\s*(\(?\s*)*(?P<first>\w+)", stripped, flags=re.I)
+
+    # Determine first word/token from the string-literal-stripped SQL
+    first_match = re.match(r"^\s*(\(?\s*)*(?P<first>\w+)", stripped_for_split, flags=re.I)
     if not first_match:
         return False
     first_token = first_match.group("first").upper()
-    if first_token not in {"SELECT", "WITH"}:
+    if first_token not in ALLOWED_LEADING_KEYWORDS:
         return False
-    # ensure forbidden keywords not present as whole words
-    for kw in FORBIDDEN_KEYWORDS:
-        if re.search(rf"\b{kw}\b", stripped, flags=re.I):
-            return False
-    return True
 
+    # Conservative keyword scanning: check the comment-stripped SQL (not removing strings)
+    # to ensure we err on the side of safety when sqlparse is absent.
+    for kw in FORBIDDEN_KEYWORDS:
+        if re.search(rf"\b{kw}\b", stripped_comments, flags=re.I):
+            return False
+
+    return True
 
 def _is_read_only_sql_sqlparse(sql: str) -> bool:
     """
@@ -79,9 +200,9 @@ def _is_read_only_sql_sqlparse(sql: str) -> bool:
 
     Rules:
     - Use sqlparse.split() to ensure a single statement (ignoring empty segments).
-    - Parse the statement and ensure the first meaningful token is SELECT or WITH.
+    - Parse the statement and ensure the first meaningful token is in ALLOWED_LEADING_KEYWORDS.
     - Walk the flattened token stream and reject if a real SQL Keyword token
-      (DDL/DML) matches any FORBIDDEN_KEYWORDS.
+      matches any FORBIDDEN_KEYWORDS.
     - Ignore occurrences of forbidden words inside string literals or comments.
     - On unexpected parse errors we conservatively reject (safe-fail).
     """
@@ -96,13 +217,13 @@ def _is_read_only_sql_sqlparse(sql: str) -> bool:
             return False
         stmt = parsed[0]
 
-        # First meaningful token must be SELECT or WITH
+        # First meaningful token must be in allowed set
         first_token = stmt.token_first(skip_cm=True)
         if first_token is None:
             return False
         ft_val = getattr(first_token, "value", str(first_token)).strip()
         first_word = ft_val.split(maxsplit=1)[0].upper() if ft_val else ""
-        if first_word not in {"SELECT", "WITH"}:
+        if first_word not in ALLOWED_LEADING_KEYWORDS:
             return False
 
         # Walk tokens and detect forbidden keywords that are real SQL keywords.
@@ -130,14 +251,14 @@ def _is_read_only_sql_sqlparse(sql: str) -> bool:
                 if val in FORBIDDEN_KEYWORDS:
                     logger.debug("Rejected query due to forbidden keyword token: %s", val)
                     return False
-            # Additionally, defense-in-depth: if a standalone forbidden word appears
-            # in the stripped SQL outside of string/comments, reject.
-        stripped = _strip_sql_comments(sql)
+
+        # Additional safety net: regex scan on comment-stripped, string-stripped SQL
+        stripped_no_strings = _strip_string_literals(_strip_sql_comments(sql))
         for kw in FORBIDDEN_KEYWORDS:
-            if re.search(rf"\b{kw}\b", stripped, flags=re.I):
-                # If the regex finds the word, ensure it's not only present inside a string literal.
-                # We already skipped string literals above, so this is an extra safety net.
-                logger.debug("Rejected query due to forbidden keyword detected by regex: %s", kw)
+            if re.search(rf"\b{kw}\b", stripped_no_strings, flags=re.I):
+                logger.debug(
+                    "Rejected query due to forbidden keyword detected by regex after stripping strings: %s", kw
+                )
                 return False
 
         return True
@@ -146,16 +267,18 @@ def _is_read_only_sql_sqlparse(sql: str) -> bool:
         logger.exception("sqlparse-based validation encountered an error; rejecting query")
         return False
 
-
 def _is_read_only_sql(sql: str) -> bool:
     """
     Decide which validator to use: prefer sqlparse if available,
     otherwise fall back to conservative regex checks.
+
+    Notes:
+      - This validator errs on the side of safety: when in doubt it rejects.
+      - Allowed starting statements: SELECT, WITH, EXPLAIN, VALUES.
     """
     if _HAS_SQLPARSE:
         return _is_read_only_sql_sqlparse(sql)
     return _is_read_only_sql_regex(sql)
-
 
 class SQLMCPTools:
     """
@@ -212,8 +335,12 @@ class SQLMCPTools:
         dependency when not needed.
         Raises ValueError if query is not permitted or execution fails.
         """
-        if not _is_read_only_sql(sql_query):
-            raise ValueError("Only single-statement read-only SELECT/WITH queries are allowed")
+        # Normalize the SQL by stripping balanced outer parentheses which some
+        # databases (notably SQLite) don't accept for a top-level statement.
+        normalized_sql = _strip_outer_parentheses(sql_query)
+
+        if not _is_read_only_sql(normalized_sql):
+            raise ValueError("Only single-statement read-only SELECT/WITH/EXPLAIN/VALUES queries are allowed")
 
         # Lazy import prometheus metrics (optional)
         _metrics_enabled = False
@@ -247,7 +374,9 @@ class SQLMCPTools:
         try:
             with self.engine.connect() as conn:
                 # Use a safe SQL text construct; SQLAlchemy will handle parameters and execution.
-                stmt = text(sql_query)
+                # Execute the normalized SQL (outer parentheses stripped) to accommodate DBs
+                # like SQLite which reject a top-level parenthesized SELECT.
+                stmt = text(normalized_sql)
                 result = conn.execute(stmt)
                 # mappings() returns rows as dict-like objects
                 rows = [dict(r) for r in result.mappings().all()]
