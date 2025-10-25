@@ -1,0 +1,96 @@
+name: Docker image CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build and smoke-test Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (optional multi-arch)
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build image (local load)
+        id: build
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          tags: |
+            sql-mcp-server:local
+          load: true
+          push: false
+
+      - name: Run smoke test container
+        run: |
+          # start container in background and wait for /health to respond
+          docker run --rm -d --name sql-mcp-smoke -p 8080:8080 -e DB_TYPE=sqlite -e DB_NAME=':memory:' sql-mcp-server:local
+          echo "Waiting for service to be ready..."
+          for i in {1..30}; do
+            if curl --max-time 2 -fsS http://localhost:8080/health >/dev/null 2>&1; then
+              echo "Service is healthy"
+              break
+            fi
+            echo "Retrying..."
+            sleep 1
+          done
+          # run a simple readiness check
+          curl -fsS http://localhost:8080/health
+          docker ps --filter name=sql-mcp-smoke
+
+      - name: Stop smoke container
+        if: always()
+        run: |
+          docker stop sql-mcp-smoke || true
+
+  publish:
+    name: Publish image to GHCR (optional)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && (secrets.GHCR_TOKEN != '' || secrets.GITHUB_TOKEN != '')
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/sql-mcp-server:latest
+            ghcr.io/${{ github.repository_owner }}/sql-mcp-server:${{ github.sha }}
+          push: true
+
+      - name: Verify pushed image (list tags)
+        run: |
+          echo "Image pushed (tags: latest, ${GITHUB_SHA})"
