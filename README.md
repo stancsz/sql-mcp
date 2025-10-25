@@ -47,6 +47,41 @@ python -m sql_mcp_server.server
 pytest -q
 ```
 
+Integration tests (Postgres)
+- 用途：在本機或 CI 上以真正的 Postgres 驗證整合行為（例如 `list_tables()` 與 schema 檢索）。
+- 前置條件：已安裝 Docker 與 Docker Compose（或使用 Docker 支援的 runner）。
+
+快速在本機執行（Linux / macOS）
+```bash
+# 複製範例 env 檔案
+cp .env.example .env
+
+# 建立並啟動 Postgres 服務
+docker compose up -d
+
+# 等待 Postgres 健康後執行 integration tests
+pytest -q -m integration
+
+# 測試完成後清理
+docker compose down
+```
+
+快速在本機執行（Windows PowerShell）
+```powershell
+Copy-Item .env.example .env
+docker compose up -d
+pytest -q -m integration
+docker compose down
+```
+
+CI 行為
+- 本專案的 CI 已包含一個 `integration` job（使用 GitHub Actions services postgres:15-alpine），負責啟動 Postgres、等待 pg_isready，並執行 `pytest -q -m integration`。
+- 若要在 CI 中改變資料庫設定，請調整 `.github/workflows/ci.yml` 的環境變數（DB_*）。
+
+建議
+- 若要在 CI 或本機上穩定執行，請務必使用與 CI 相容的 Python 與套件版本（參考 `pyproject.toml`）。
+- 若不想在本機啟用 Postgres，可暫時以 sqlite 測試：`set DB_TYPE=sqlite && pytest -q`（Windows）或 `DB_TYPE=sqlite pytest -q`（Linux/macOS）。
+
 實作重點與安全設計
 - SQL 允許性檢查：execute_read_only_sql 先移除註解、禁止多重語句（分號分隔）、確保第一個 token 為 SELECT 或 WITH，並檢查整個查詢中是否含有禁止的關鍵字（以完整單字比對）。
 - 此檢查採保守策略；在高安全需求環境建議搭配完整 SQL 解析器（例如 sqlparse、或更嚴格的 AST 檢查）做二次驗證。
