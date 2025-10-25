@@ -1,3 +1,46 @@
+"""
+sql_mcp_server.tools
+
+Read-only SQL validation and execution helpers.
+
+Purpose
+- Enforce a strict read-only policy for user-provided SQL executed by the server.
+- Provide utilities used by SQLMCPTools.execute_read_only_sql() to normalize,
+  validate, and safely execute SELECT-style queries.
+
+Policy summary
+- Allowed leading statements: SELECT, WITH, EXPLAIN, VALUES.
+- Disallowed keywords (examples): INSERT, UPDATE, DELETE, DROP, CREATE,
+  ALTER, TRUNCATE, GRANT, REVOKE, MERGE, COPY, BEGIN, COMMIT, ROLLBACK,
+  SET, ATTACH, VACUUM.
+- Only single-statement queries are permitted. Multi-statement payloads are rejected.
+- Validation errs on the side of safety: when in doubt the validator rejects.
+
+Validation strategy
+1. Prefer sqlparse token-level validation when the `sqlparse` package is
+   available:
+   - Use sqlparse.split()/parse() to ensure a single statement.
+   - Confirm the first meaningful token is in the allowed set.
+   - Walk the flattened token stream and reject any Keyword tokens that
+     match forbidden keywords, while skipping comments and string literals.
+   - sqlparse reduces false positives by distinguishing keywords from literal text.
+
+2. Conservative regex fallback (when sqlparse is not present):
+   - Strip comments, remove string/dollar-quoted literals for statement-splitting,
+     ensure a single statement and that the first token is allowed.
+   - For keyword scanning the fallback checks the comment-stripped SQL without
+     removing string literals (conservative) and will reject queries that
+     include forbidden words even if they appear inside string literals.
+   - This means environments lacking sqlparse will be more conservative.
+
+Notes for operators & CI
+- Recommended: install the parsing extras in CI to run sqlparse-based checks:
+  python -m pip install -e ".[parsing]"
+- CI should explicitly test both paths if desired (with and without sqlparse),
+  or include sqlparse to mirror production parsing behavior.
+- The implementation prioritizes safety; additional runtime limits (query
+  length, execution timeout) are recommended as follow-up tasks.
+"""
 from __future__ import annotations
 import logging
 import re
@@ -45,7 +88,6 @@ except Exception:
     _HAS_SQLPARSE = False
     logger.debug("sqlparse not available, falling back to conservative regex checks.")
 
-
 def _strip_sql_comments(sql: str) -> str:
     """Remove --, # single-line and /* */ block comments."""
     # remove block comments first (/* ... */)
@@ -55,7 +97,6 @@ def _strip_sql_comments(sql: str) -> str:
     # remove hash-style (#) single-line comments (common in some clients)
     sql = re.sub(r"#.*?$", " ", sql, flags=re.M)
     return sql
-
 
 def _strip_string_literals(sql: str) -> str:
     """
@@ -79,7 +120,6 @@ def _strip_string_literals(sql: str) -> str:
     s = re.sub(r'"(?:\\.|""|[^"])*"', " ", s, flags=re.S)
 
     return s
-
 
 def _strip_outer_parentheses(sql: str) -> str:
     """
@@ -111,7 +151,6 @@ def _strip_outer_parentheses(sql: str) -> str:
             continue
         break
     return s
-
 
 def _is_read_only_sql_regex(sql: str) -> bool:
     """
@@ -154,7 +193,6 @@ def _is_read_only_sql_regex(sql: str) -> bool:
             return False
 
     return True
-
 
 def _is_read_only_sql_sqlparse(sql: str) -> bool:
     """
@@ -229,7 +267,6 @@ def _is_read_only_sql_sqlparse(sql: str) -> bool:
         logger.exception("sqlparse-based validation encountered an error; rejecting query")
         return False
 
-
 def _is_read_only_sql(sql: str) -> bool:
     """
     Decide which validator to use: prefer sqlparse if available,
@@ -242,7 +279,6 @@ def _is_read_only_sql(sql: str) -> bool:
     if _HAS_SQLPARSE:
         return _is_read_only_sql_sqlparse(sql)
     return _is_read_only_sql_regex(sql)
-
 
 class SQLMCPTools:
     """
