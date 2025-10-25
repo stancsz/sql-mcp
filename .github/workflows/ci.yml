@@ -7,6 +7,35 @@ on:
     branches: [ main ]
 
 jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.10, 3.11, 3.12]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dev tooling
+        run: |
+          python -m pip install --upgrade pip
+          # Try installing dev extras (ruff, mypy) using constraints if available
+          python -m pip install -c requirements-constraints.txt -e ".[dev]" || python -m pip install ruff mypy
+
+      - name: Run ruff (style)
+        run: |
+          ruff check .
+
+      - name: Run mypy (static types)
+        run: |
+          mypy
+
   test:
     runs-on: ubuntu-latest
     strategy:

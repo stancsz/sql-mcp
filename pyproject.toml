@@ -21,10 +21,25 @@ postgresql = ["psycopg2-binary"]
 mysql = ["pymysql"]
 mssql = ["pyodbc"]
 parsing = ["sqlparse"]
+dev = ["ruff", "mypy"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
 addopts = "-q"
+
+# Ruff configuration (basic, project-wide)
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = ["build", "dist", ".venv", ".git", "__pycache__"]
+
+# Mypy configuration (conservative/defaults to avoid blocking)
+[tool.mypy]
+python_version = "3.10"
+files = ["sql_mcp_server", "tests"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+disallow_untyped_defs = false
 
 [build-system]
 requires = ["setuptools", "wheel"]

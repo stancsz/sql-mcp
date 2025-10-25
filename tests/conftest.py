@@ -13,9 +13,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # Shared fixtures for tests
-import pytest
-from sqlalchemy import MetaData, Table, Column, Integer, String, text
-from sql_mcp_server.db import create_engine_from_url
+import pytest  # noqa: E402
+from sqlalchemy import MetaData, Table, Column, Integer, String, text  # noqa: E402
+from sql_mcp_server.db import create_engine_from_url  # noqa: E402
 
 @pytest.fixture
 def engine():
