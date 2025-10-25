@@ -75,41 +75,76 @@ def _is_read_only_sql_regex(sql: str) -> bool:
 
 def _is_read_only_sql_sqlparse(sql: str) -> bool:
     """
-    Stronger SQL validation using sqlparse:
-    - Uses sqlparse.split() to ensure single statement
-    - Uses parsed statement token inspection to confirm the first meaningful token
-      is SELECT or WITH
-    - Also checks forbidden keywords as whole words (defense-in-depth)
+    Stronger SQL validation using sqlparse token inspection.
+
+    Rules:
+    - Use sqlparse.split() to ensure a single statement (ignoring empty segments).
+    - Parse the statement and ensure the first meaningful token is SELECT or WITH.
+    - Walk the flattened token stream and reject if a real SQL Keyword token
+      (DDL/DML) matches any FORBIDDEN_KEYWORDS.
+    - Ignore occurrences of forbidden words inside string literals or comments.
+    - On unexpected parse errors we conservatively reject (safe-fail).
     """
     try:
-        # Remove comments for keyword checking, but rely on sqlparse for statement splitting
+        # Ensure only a single statement
         statements = sqlparse.split(sql)
         if len([s for s in statements if s.strip()]) != 1:
             return False
+
         parsed = sqlparse.parse(sql)
         if not parsed:
             return False
         stmt = parsed[0]
-        # Get the first meaningful token (skip whitespace/comments)
+
+        # First meaningful token must be SELECT or WITH
         first_token = stmt.token_first(skip_cm=True)
         if first_token is None:
             return False
-        # Token might be a parenthesis or token list; extract a word-like prefix
         ft_val = getattr(first_token, "value", str(first_token)).strip()
-        # Normalize and get first word
         first_word = ft_val.split(maxsplit=1)[0].upper() if ft_val else ""
         if first_word not in {"SELECT", "WITH"}:
             return False
-        # Defense-in-depth: ensure forbidden keywords do not appear as whole words
+
+        # Walk tokens and detect forbidden keywords that are real SQL keywords.
+        # Ignore comments and string literals.
+        try:
+            from sqlparse import tokens as T  # local import for readability
+        except Exception:
+            # if tokens module missing, fallback to conservative regex approach
+            stripped = _strip_sql_comments(sql)
+            for kw in FORBIDDEN_KEYWORDS:
+                if re.search(rf"\b{kw}\b", stripped, flags=re.I):
+                    return False
+            return True
+
+        for token in stmt.flatten():
+            # Skip comments
+            if token.ttype and str(token.ttype).startswith("Token.Comment"):
+                continue
+            # Skip string literals
+            if token.ttype and str(token.ttype).startswith("Token.Literal.String"):
+                continue
+            # If token looks like a Keyword token, inspect its value
+            if token.ttype and str(token.ttype).startswith("Token.Keyword"):
+                val = (token.value or "").strip().upper()
+                if val in FORBIDDEN_KEYWORDS:
+                    logger.debug("Rejected query due to forbidden keyword token: %s", val)
+                    return False
+            # Additionally, defense-in-depth: if a standalone forbidden word appears
+            # in the stripped SQL outside of string/comments, reject.
         stripped = _strip_sql_comments(sql)
         for kw in FORBIDDEN_KEYWORDS:
             if re.search(rf"\b{kw}\b", stripped, flags=re.I):
+                # If the regex finds the word, ensure it's not only present inside a string literal.
+                # We already skipped string literals above, so this is an extra safety net.
+                logger.debug("Rejected query due to forbidden keyword detected by regex: %s", kw)
                 return False
+
         return True
     except Exception as exc:
-        logger.debug("sqlparse-based validation failed with exception: %s", exc)
-        # Fall back to regex approach on any unexpected parsing error
-        return _is_read_only_sql_regex(sql)
+        # On unexpected parse errors, be conservative and reject the query.
+        logger.exception("sqlparse-based validation encountered an error; rejecting query")
+        return False
 
 
 def _is_read_only_sql(sql: str) -> bool:

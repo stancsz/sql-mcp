@@ -27,13 +27,19 @@ def test_execute_allows_leading_parenthesis_select(engine):
     rows = tools.execute_read_only_sql(sql)
     assert rows and rows[0]["id"] == 2
 
-def test_execute_rejects_forbidden_keyword_inside_string_literal(engine):
-    # Conservative validator will reject queries containing forbidden keywords
-    # even inside string literals — ensure this is enforced.
+def test_execute_forbidden_keyword_inside_string_literal(engine):
+    # Behavior depends on sqlparse availability:
+    # - If sqlparse is installed, the parser ignores string literals and the query is allowed.
+    # - If sqlparse is not installed, the conservative regex fallback may reject it.
+    from sql_mcp_server import tools as _tools
     tools = SQLMCPTools(engine)
-    bad = "SELECT 'DROP TABLE users' as payload"
-    with pytest.raises(ValueError):
-        tools.execute_read_only_sql(bad)
+    sql = "SELECT 'DROP TABLE users' as payload"
+    if getattr(_tools, "_HAS_SQLPARSE", False):
+        rows = tools.execute_read_only_sql(sql)
+        assert isinstance(rows, list)
+    else:
+        with pytest.raises(ValueError):
+            tools.execute_read_only_sql(sql)
 
 def test_execute_allows_sql_with_leading_comments_and_whitespace(engine):
     tools = SQLMCPTools(engine)
