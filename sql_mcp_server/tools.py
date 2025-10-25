@@ -207,10 +207,43 @@ class SQLMCPTools:
         Execute a read-only SQL query and return rows as list of dicts.
 
         Strictly enforces read-only policy using _is_read_only_sql guard.
+        Instrumentation: if prometheus-client is available, record request counts
+        and query duration. This function lazy-loads prometheus to avoid hard
+        dependency when not needed.
         Raises ValueError if query is not permitted or execution fails.
         """
         if not _is_read_only_sql(sql_query):
             raise ValueError("Only single-statement read-only SELECT/WITH queries are allowed")
+
+        # Lazy import prometheus metrics (optional)
+        _metrics_enabled = False
+        try:
+            from prometheus_client import Counter as _Counter, Histogram as _Histogram  # type: ignore
+            _metrics_enabled = True
+        except Exception:
+            _metrics_enabled = False
+
+        # Initialize module-level metrics once if prometheus is available
+        if _metrics_enabled:
+            if "_requests_counter" not in globals():
+                try:
+                    globals()["_requests_counter"] = _Counter(
+                        "sqlmcp_execute_requests_total",
+                        "Total number of execute_read_only_sql calls",
+                    )
+                    globals()["_query_histogram"] = _Histogram(
+                        "sqlmcp_query_duration_seconds",
+                        "Duration of read-only queries in seconds",
+                    )
+                except Exception:
+                    # Avoid failing queries if metrics cannot be registered
+                    logger.exception("Failed to initialize prometheus metrics")
+                    _metrics_enabled = False
+
+        rows: List[Dict[str, Any]] = []
+        from time import perf_counter
+
+        start = perf_counter()
         try:
             with self.engine.connect() as conn:
                 # Use a safe SQL text construct; SQLAlchemy will handle parameters and execution.
@@ -218,8 +251,15 @@ class SQLMCPTools:
                 result = conn.execute(stmt)
                 # mappings() returns rows as dict-like objects
                 rows = [dict(r) for r in result.mappings().all()]
-                return rows
         except SQLAlchemyError as exc:
             logger.exception("Error executing read-only SQL")
-            # propagate as ValueError for the MCP layer to surface
             raise ValueError(f"Error executing query: {exc}") from exc
+        finally:
+            elapsed = perf_counter() - start
+            if _metrics_enabled:
+                try:
+                    globals()["_requests_counter"].inc()
+                    globals()["_query_histogram"].observe(elapsed)
+                except Exception:
+                    logger.debug("Failed to record prometheus metrics for query")
+        return rows

@@ -126,22 +126,83 @@ def build_mcp_server() -> object:
 
 def create_http_app(settings: Optional[Settings] = None):
     """
-    Create and return a FastAPI app exposing basic health and readiness endpoints.
+    Create and return a FastAPI app exposing basic health, readiness and metrics endpoints.
 
-    - GET /health  -> {"status": "ok"} (service up)
+    - GET /health  -> {"status": "ok"}
     - GET /ready   -> {"db": "ok"} or HTTP 503 with {"db": "error", "reason": "..."}
+    - GET /metrics -> Prometheus metrics (if prometheus-client installed) or 501
     """
     try:
         from fastapi import FastAPI, Response, status
+        from fastapi.responses import JSONResponse, PlainTextResponse
         from sqlalchemy import text
     except Exception as exc:  # pragma: no cover - runtime check
         raise RuntimeError("fastapi and sqlalchemy are required for the HTTP app. Install extras.") from exc
 
+    # optional prometheus support
+    try:
+        from prometheus_client import CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST, Counter, Histogram
+        _HAS_PROM = True
+    except Exception:
+        CollectorRegistry = None  # type: ignore
+        generate_latest = None  # type: ignore
+        CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+        Counter = None  # type: ignore
+        Histogram = None  # type: ignore
+        _HAS_PROM = False
+
     _configure_logging()
     app = FastAPI(title="sql-mcp-server")
 
+    # application-scoped placeholders; set in startup
     settings = settings or Settings()
-    engine = create_engine_from_settings(settings)
+    app.state.engine = None
+    app.state.metrics_registry = None
+    app.state.requests_counter = None
+    app.state.query_histogram = None
+
+    def _create_engine():
+        return create_engine_from_settings(settings)
+
+    @app.on_event("startup")
+    def _startup():
+        logger.info("app startup: creating engine and initializing metrics")
+        # create engine once on startup
+        try:
+            app.state.engine = _create_engine()
+        except Exception:
+            logger.exception("failed to create engine on startup")
+            raise
+
+        # setup prometheus metrics if available
+        if _HAS_PROM:
+            try:
+                reg = CollectorRegistry(auto_describe=True)
+                # basic metrics
+                app.state.requests_counter = Counter(
+                    "sqlmcp_execute_requests_total", "Total number of execute_read_only_sql calls", registry=reg
+                )
+                app.state.query_histogram = Histogram(
+                    "sqlmcp_query_duration_seconds", "Duration of read-only queries in seconds", registry=reg
+                )
+                app.state.metrics_registry = reg
+                logger.info("Prometheus metrics initialized")
+            except Exception:
+                logger.exception("Failed to initialize Prometheus metrics")
+                app.state.metrics_registry = None
+        else:
+            logger.info("prometheus-client not available; /metrics will return 501")
+
+    @app.on_event("shutdown")
+    def _shutdown():
+        logger.info("app shutdown: disposing engine and cleaning up")
+        try:
+            engine = getattr(app.state, "engine", None)
+            if engine is not None:
+                engine.dispose()
+                logger.info("engine disposed")
+        except Exception:
+            logger.exception("Error disposing engine on shutdown")
 
     @app.get("/health")
     def health() -> dict:
@@ -152,26 +213,38 @@ def create_http_app(settings: Optional[Settings] = None):
         return {"status": "ok"}
 
     @app.get("/ready")
-    def ready() -> "fastapi.responses.JSONResponse":
+    def ready() -> JSONResponse:
         """
         Readiness probe. Verifies the database connection by running a trivial query.
         Returns 200 if the DB is reachable, otherwise 503.
-
-        Uses JSONResponse to avoid dependency-injection edge-cases with Response
-        objects in some test harnesses.
         """
-        from fastapi import status
-        from fastapi.responses import JSONResponse
-
         logger.info("readiness check: verifying database connectivity")
         try:
+            engine = getattr(app.state, "engine", None)
+            if engine is None:
+                engine = create_engine_from_settings(settings)
             with engine.connect() as conn:
-                # Use a trivial lightweight query that works on SQLite/Postgres/MySQL
                 conn.execute(text("SELECT 1"))
             return JSONResponse({"db": "ok"}, status_code=status.HTTP_200_OK)
         except Exception as exc:  # broad catch to convert to a controlled response
             logger.exception("readiness check failed")
             return JSONResponse({"db": "error", "reason": str(exc)}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    @app.get("/metrics")
+    def metrics() -> Response:
+        """
+        Expose Prometheus metrics if prometheus-client is available.
+        Returns 501 Not Implemented when not installed.
+        """
+        if not _HAS_PROM or app.state.metrics_registry is None or generate_latest is None:
+            logger.debug("Metrics endpoint requested but prometheus-client not available")
+            return JSONResponse({"error": "prometheus metrics not enabled"}, status_code=status.HTTP_501_NOT_IMPLEMENTED)
+        try:
+            data = generate_latest(app.state.metrics_registry)
+            return PlainTextResponse(data, media_type=CONTENT_TYPE_LATEST)
+        except Exception:
+            logger.exception("Failed to generate metrics")
+            return JSONResponse({"error": "failed to generate metrics"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     return app
 
